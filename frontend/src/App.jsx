@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import axios from 'axios'
 
-const API = 'http://127.0.0.1:8000'
+const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
 const api = axios.create({ baseURL: API + '/api' })
 const COUNTS = [20, 50, 100, 250, 500]
 const CHIPS = ['Gyms', 'Bakeries', 'Restaurants', 'Cafes', 'Pharmacies', 'Salons', 'Hotels', 'Clinics']

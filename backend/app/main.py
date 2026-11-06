@@ -177,3 +177,7 @@ def export(format: str = "csv", q: str = "", city: str = "", pincode: str = "", 
                         headers={"Content-Disposition": "attachment; filename=leads.xlsx"})
     return Response(df.to_csv(index=False), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=leads.csv"})
+
+@app.get("/")
+def root():
+    return {"status": "ok", "docs": "/docs"}
