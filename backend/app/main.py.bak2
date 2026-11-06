@@ -1,0 +1,173 @@
+import hashlib, io, math, os, re
+from datetime import datetime
+import pandas as pd, phonenumbers
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+from sqlalchemy import or_
+from .db import Base, SessionLocal, engine, get_db
+from .models import Lead, Search
+from .scraper import scrape
+
+Base.metadata.create_all(engine)
+app = FastAPI(title="LeadIt API")
+app.add_middleware(CORSMiddleware, allow_origins=os.getenv("CORS_ORIGINS", "").split(","),
+                   allow_methods=["*"], allow_headers=["*"])
+COLS = ["name", "phone", "address", "area", "city", "state", "pincode", "maps_url", "website",
+        "tier", "confidence", "distance_km"]
+API = COLS + ["lat", "lng", "ring", "business_type"]
+
+
+class SearchIn(BaseModel):
+    business_type: str = Field(min_length=2, max_length=100)
+    location: str = Field(min_length=2, max_length=150)
+    count: int = Field(ge=1, le=2500)
+
+
+def km(a, b, c, d):
+    p, q = math.radians(a), math.radians(c)
+    h = math.sin((q - p) / 2) ** 2 + math.cos(p) * math.cos(q) * math.sin(math.radians(d - b) / 2) ** 2
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+
+def e164(raw):
+    try:
+        n = phonenumbers.parse(raw, os.getenv("DEFAULT_REGION", "IN"))
+        if phonenumbers.is_valid_number(n):
+            return phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
+        pass
+    return ""
+
+
+def ring(d):
+    return "<1.5 km" if d < 1.5 else "1.5-3.5 km" if d < 3.5 else "3.5-6 km" if d < 6 else ">6 km"
+
+
+def clean(r):
+    r["phone"] = e164(r.get("phone", "")) or r.get("phone", "")
+    addr = r.get("address", "")
+    parts = [x.strip() for x in addr.split(",") if x.strip()]
+    pin = re.search(r"\b[1-9]\d{5}\b", addr)
+    r["pincode"] = pin.group(0) if pin else ""
+    r["state"] = re.sub(r"\d+", "", parts[-1]).strip() if parts else ""
+    r["city"] = parts[-2] if len(parts) > 1 else ""
+    r["area"] = parts[-3] if len(parts) > 2 else ""
+    sc = 0.3 + 0.3 * bool(r["phone"]) + 0.2 * bool(r.get("website")) + 0.2 * bool(addr)
+    r["confidence"] = round(sc, 2)
+    r["tier"] = "High" if sc >= .8 else "Medium" if sc >= .5 else "Low"
+    r["distance_km"] = 0
+
+
+def run(sid):
+    db = SessionLocal()
+    s = db.get(Search, sid)
+
+    def log(m):
+        s.log = (s.log or "") + f"{datetime.utcnow():%H:%M:%S}  {m}\n"
+        db.commit()
+
+    def on_row(r):
+        clean(r)
+        lat, lng = r.get("lat") or 0, r.get("lng") or 0
+        key = hashlib.sha1(f"{re.sub(r'[^a-z0-9]', '', r['name'].lower())}|{lat:.3f},{lng:.3f}".encode()).hexdigest()
+        s.found += 1
+        if not db.query(Lead).filter_by(dedupe_key=key).first():
+            db.add(Lead(dedupe_key=key, business_type=s.business_type,
+                        **{k: r.get(k) for k in COLS + ["lat", "lng"]}))
+            s.new_count += 1
+        db.commit()
+        if s.found % 5 == 0:
+            log(f"{s.found}/{s.requested} leads saved")
+
+    try:
+        s.status = "running"
+        log("Job started")
+        center = scrape(s.business_type, s.location, s.requested, log, on_row)
+        if s.found == 0:
+            raise RuntimeError("No places found. Check the log, try a broader place, or add proxies.")
+        if center:
+            for l in db.query(Lead).filter(Lead.ring.is_(None)):
+                if l.lat:
+                    l.distance_km = round(km(center[0], center[1], l.lat, l.lng), 2)
+                    l.ring = ring(l.distance_km)
+            db.commit()
+        log(f"Done: {s.found} leads, {s.new_count} new")
+        s.status = "completed"
+    except Exception as e:
+        db.rollback()
+        s.status, s.error = "failed", str(e)[:400]
+        log(f"FAILED: {str(e)[:200]}")
+    db.commit()
+    db.close()
+
+
+def sd(s):
+    return {"id": s.id, "business_type": s.business_type, "location": s.location, "requested": s.requested,
+            "found": s.found, "new_count": s.new_count, "status": s.status, "error": s.error,
+            "log": (s.log or "").splitlines()[-40:], "created_at": s.created_at.isoformat()}
+
+
+@app.post("/api/searches", status_code=202)
+def create(body: SearchIn, bg: BackgroundTasks, db=Depends(get_db)):
+    s = Search(business_type=body.business_type.strip(), location=body.location.strip(), requested=body.count)
+    db.add(s)
+    db.commit()
+    bg.add_task(run, s.id)
+    return sd(s)
+
+
+@app.get("/api/searches")
+def searches(db=Depends(get_db)):
+    return [sd(s) for s in db.query(Search).order_by(Search.id.desc()).limit(100)]
+
+
+@app.get("/api/searches/{sid}")
+def one(sid: int, db=Depends(get_db)):
+    s = db.get(Search, sid)
+    if not s:
+        raise HTTPException(404, "Not found")
+    return sd(s)
+
+
+def flt(db, q, city, pincode, tier, has_website, has_phone):
+    qs = db.query(Lead)
+    if q:
+        qs = qs.filter(or_(Lead.name.ilike(f"%{q}%"), Lead.address.ilike(f"%{q}%"), Lead.phone.ilike(f"%{q}%")))
+    if city:
+        qs = qs.filter(Lead.city.ilike(city))
+    if pincode:
+        qs = qs.filter(Lead.pincode == pincode)
+    if tier:
+        qs = qs.filter(Lead.tier == tier)
+    if has_website:
+        qs = qs.filter(Lead.website != "", Lead.website.isnot(None))
+    if has_phone:
+        qs = qs.filter(Lead.phone != "", Lead.phone.isnot(None))
+    return qs
+
+
+@app.get("/api/leads")
+def leads(q: str = "", city: str = "", pincode: str = "", tier: str = "", has_website: bool = False,
+          has_phone: bool = False, sort_by: str = "id", order: str = "desc",
+          page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=200), db=Depends(get_db)):
+    qs = flt(db, q, city, pincode, tier, has_website, has_phone)
+    col = getattr(Lead, sort_by if sort_by in COLS + ["id"] else "id")
+    rows = qs.order_by(col.asc() if order == "asc" else col.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return {"total": qs.count(), "page": page, "page_size": page_size,
+            "items": [{"id": l.id, **{c: getattr(l, c) for c in API}} for l in rows]}
+
+
+@app.get("/api/export")
+def export(format: str = "csv", q: str = "", city: str = "", pincode: str = "", tier: str = "",
+           has_website: bool = False, has_phone: bool = False, db=Depends(get_db)):
+    rows = flt(db, q, city, pincode, tier, has_website, has_phone).order_by(Lead.id).all()
+    df = pd.DataFrame([{c: getattr(l, c) for c in COLS} for l in rows], columns=COLS)
+    if format == "xlsx":
+        b = io.BytesIO()
+        df.to_excel(b, index=False)
+        return Response(b.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": "attachment; filename=leads.xlsx"})
+    return Response(df.to_csv(index=False), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=leads.csv"})

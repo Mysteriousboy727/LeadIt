@@ -1,0 +1,80 @@
+﻿import { useState } from 'react'
+import axios from 'axios'
+
+const api = axios.create({ baseURL: 'http://127.0.0.1:8000/api/auth' })
+const msg = (x) => {
+  const d = x?.response?.data?.detail
+  if (Array.isArray(d)) return d[0]?.msg || 'Check the form.'
+  return typeof d === 'string' ? d : 'Cannot reach the backend on port 8000. Is uvicorn running?'
+}
+
+export default function Auth({ onAuth }) {
+  const [mode, setMode] = useState('login')
+  const [f, setF] = useState({ name: '', email: '', password: '' })
+  const [code, setCode] = useState('')
+  const [err, setErr] = useState('')
+  const [info, setInfo] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const run = async (fn) => {
+    setErr(''); setInfo(''); setBusy(true)
+    try { await fn() } catch (x) { setErr(msg(x)) } finally { setBusy(false) }
+  }
+
+  const signup = (e) => { e.preventDefault(); run(async () => {
+    const { data } = await api.post('/signup', f)
+    setInfo(data.message); setMode('verify')
+  }) }
+
+  const login = (e) => { e.preventDefault(); run(async () => {
+    const { data } = await api.post('/login', { email: f.email, password: f.password })
+    if (data.needs_verification) { setInfo('Your email is not verified. We sent you a new code.'); setMode('verify') }
+    else onAuth(data.token, data.user)
+  }) }
+
+  const verify = (e) => { e.preventDefault(); run(async () => {
+    const { data } = await api.post('/verify', { email: f.email, code })
+    onAuth(data.token, data.user)
+  }) }
+
+  const resend = () => run(async () => {
+    await api.post('/resend', { email: f.email }); setInfo('A new code was sent.')
+  })
+
+  return (
+    <div className="authwrap">
+      <div className="authbrand">LeadIt</div>
+      <div className="card stack">
+        {mode === 'verify' ? (
+          <form className="stack" onSubmit={verify}>
+            <h2>Verify your email</h2>
+            <p className="label">Enter the 6-digit code sent to {f.email}</p>
+            <input className="field otp" inputMode="numeric" maxLength={6} placeholder="000000" required
+              value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))} />
+            <button className="btn" disabled={busy || code.length !== 6}>{busy ? 'Checking...' : 'Verify and continue'}</button>
+            <button type="button" className="btn ghost" disabled={busy} onClick={resend}>Resend code</button>
+          </form>
+        ) : (
+          <form className="stack" onSubmit={mode === 'signup' ? signup : login}>
+            <h2>{mode === 'signup' ? 'Create your account' : 'Welcome back'}</h2>
+            {mode === 'signup' && (
+              <input className="field" placeholder="Full name" required value={f.name}
+                onChange={(e) => setF({ ...f, name: e.target.value })} />
+            )}
+            <input className="field" type="email" placeholder="Email" required value={f.email}
+              onChange={(e) => setF({ ...f, email: e.target.value })} />
+            <input className="field" type="password" placeholder="Password (min 8 characters)" minLength={8} required
+              value={f.password} onChange={(e) => setF({ ...f, password: e.target.value })} />
+            <button className="btn" disabled={busy}>{busy ? 'Please wait...' : mode === 'signup' ? 'Sign up' : 'Log in'}</button>
+            <button type="button" className="btn ghost"
+              onClick={() => { setErr(''); setInfo(''); setMode(mode === 'signup' ? 'login' : 'signup') }}>
+              {mode === 'signup' ? 'I already have an account' : 'Create an account'}
+            </button>
+          </form>
+        )}
+        {info && <p className="label">{info}</p>}
+        {err && <p className="error">{err}</p>}
+      </div>
+    </div>
+  )
+}

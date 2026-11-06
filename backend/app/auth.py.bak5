@@ -1,0 +1,208 @@
+﻿import hashlib, hmac, os, re, secrets, smtplib, ssl
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import Boolean, Column, DateTime, Integer, String
+
+from .db import Base, get_db
+
+router = APIRouter(prefix="/api/auth")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+OTP_TTL_MIN, OTP_MAX_TRIES, RESEND_SECONDS, TOKEN_DAYS = 10, 5, 60, 7
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100))
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    pw_hash = Column(String(255), nullable=False)
+    verified = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OtpCode(Base):
+    __tablename__ = "otp_codes"
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    code_hash = Column(String(64), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0)
+    last_sent = Column(DateTime, default=datetime.utcnow)
+
+
+class AuthToken(Base):
+    __tablename__ = "auth_tokens"
+    id = Column(Integer, primary_key=True)
+    token_hash = Column(String(64), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, index=True, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+
+def _sha(s):
+    return hashlib.sha256((s + os.getenv("AUTH_SECRET", "change-me")).encode()).hexdigest()
+
+
+def hash_password(pw):
+    salt = secrets.token_hex(16)
+    return f"{salt}${hashlib.pbkdf2_hmac('sha256', pw.encode(), salt.encode(), 200_000).hex()}"
+
+
+def check_password(pw, stored):
+    try:
+        salt, h = stored.split("$")
+        return hmac.compare_digest(hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000).hex(), h)
+    except Exception:
+        return False
+
+
+def send_mail(to, code):
+    user, pw = os.getenv("SMTP_USER", ""), os.getenv("SMTP_PASS", "")
+    if not user or not pw:  # dev mode: no SMTP set, code is printed in the uvicorn window
+        print(f"\n[DEV] OTP for {to}: {code}\n")
+        return
+    m = EmailMessage()
+    m["Subject"] = "Your LeadIt verification code"
+    m["From"] = os.getenv("SMTP_FROM", user)
+    m["To"] = to
+    m.set_content(f"Your LeadIt verification code is {code}.\n"
+                  f"It expires in {OTP_TTL_MIN} minutes. If you didn't request it, ignore this email.")
+    try:
+        with smtplib.SMTP(os.getenv("SMTP_HOST", "smtp.gmail.com"),
+                          int(os.getenv("SMTP_PORT", "587")), timeout=15) as s:
+            s.starttls(context=ssl.create_default_context())
+            s.login(user, pw)
+            s.send_message(m)
+    except Exception as e:
+        print(f"[MAIL ERROR] {type(e).__name__}: {e}")
+
+
+def issue_otp(db, email, bg):
+    now = datetime.utcnow()
+    row = db.query(OtpCode).filter_by(email=email).first()
+    if row and (now - row.last_sent).total_seconds() < RESEND_SECONDS:
+        wait = RESEND_SECONDS - int((now - row.last_sent).total_seconds())
+        raise HTTPException(429, f"Please wait {wait}s before requesting another code.")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    if not row:
+        row = OtpCode(email=email)
+        db.add(row)
+    row.code_hash = _sha(f"{email}:{code}")
+    row.expires_at = now + timedelta(minutes=OTP_TTL_MIN)
+    row.attempts = 0
+    row.last_sent = now
+    db.commit()
+    bg.add_task(send_mail, email, code)
+
+
+def make_token(db, user):
+    tok = secrets.token_urlsafe(32)
+    db.add(AuthToken(token_hash=_sha(tok), user_id=user.id,
+                     expires_at=datetime.utcnow() + timedelta(days=TOKEN_DAYS)))
+    db.commit()
+    return tok
+
+
+def current_user(authorization: str = Header(default=""), db=Depends(get_db)):
+    tok = authorization.replace("Bearer ", "").strip()
+    t = db.query(AuthToken).filter_by(token_hash=_sha(tok)).first() if tok else None
+    if not t or t.expires_at < datetime.utcnow():
+        raise HTTPException(401, "Please log in.")
+    u = db.get(User, t.user_id)
+    if not u or not u.verified:
+        raise HTTPException(401, "Please log in.")
+    return u
+
+
+def udict(u):
+    return {"id": u.id, "name": u.name, "email": u.email}
+
+
+class SignupIn(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: str = Field(max_length=255)
+    password: str = Field(min_length=8, max_length=100)
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class VerifyIn(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+
+
+class EmailIn(BaseModel):
+    email: str
+
+
+@router.post("/signup", status_code=201)
+def signup(b: SignupIn, bg: BackgroundTasks, db=Depends(get_db)):
+    email = b.email.strip().lower()
+    if not EMAIL_RE.match(email):
+        raise HTTPException(422, "Enter a valid email address.")
+    u = db.query(User).filter_by(email=email).first()
+    if u and u.verified:
+        raise HTTPException(409, "This email is already registered. Please log in.")
+    if not u:
+        u = User(email=email, name=b.name.strip(), pw_hash=hash_password(b.password))
+        db.add(u)
+    else:
+        u.name, u.pw_hash = b.name.strip(), hash_password(b.password)
+    db.commit()
+    issue_otp(db, email, bg)
+    return {"message": "Verification code sent. Check your email.", "email": email}
+
+
+@router.post("/verify")
+def verify(b: VerifyIn, db=Depends(get_db)):
+    email = b.email.strip().lower()
+    row = db.query(OtpCode).filter_by(email=email).first()
+    u = db.query(User).filter_by(email=email).first()
+    if not row or not u:
+        raise HTTPException(400, "No code requested for this email.")
+    if row.expires_at < datetime.utcnow():
+        raise HTTPException(400, "Code expired. Request a new one.")
+    if row.attempts >= OTP_MAX_TRIES:
+        raise HTTPException(429, "Too many wrong attempts. Request a new code.")
+    if not hmac.compare_digest(row.code_hash, _sha(f"{email}:{b.code.strip()}")):
+        row.attempts += 1
+        db.commit()
+        raise HTTPException(400, "Wrong code.")
+    u.verified = True
+    db.delete(row)
+    db.commit()
+    return {"token": make_token(db, u), "user": udict(u)}
+
+
+@router.post("/resend")
+def resend(b: EmailIn, bg: BackgroundTasks, db=Depends(get_db)):
+    email = b.email.strip().lower()
+    u = db.query(User).filter_by(email=email).first()
+    if u and not u.verified:
+        issue_otp(db, email, bg)
+    return {"message": "If the account exists, a new code was sent."}
+
+
+@router.post("/login")
+def login(b: LoginIn, bg: BackgroundTasks, db=Depends(get_db)):
+    email = b.email.strip().lower()
+    u = db.query(User).filter_by(email=email).first()
+    if not u or not check_password(b.password, u.pw_hash):
+        raise HTTPException(401, "Wrong email or password.")
+    if not u.verified:
+        try:
+            issue_otp(db, email, bg)
+        except HTTPException:
+            pass
+        return {"needs_verification": True, "email": email}
+    return {"token": make_token(db, u), "user": udict(u)}
+
+
+@router.get("/me")
+def me(u=Depends(current_user)):
+    return udict(u)

@@ -1,0 +1,330 @@
+import { useEffect, useRef, useState } from 'react'
+import axios from 'axios'
+
+const API = 'http://127.0.0.1:8000'
+const api = axios.create({ baseURL: API + '/api' })
+const COUNTS = [20, 50, 100, 250, 500]
+const CHIPS = ['Gyms', 'Bakeries', 'Restaurants', 'Cafes', 'Pharmacies', 'Salons', 'Hotels', 'Clinics']
+const STEPS = ['Queued', 'Searching Google Maps', 'Saving', 'Done']
+const COLS = [['name', 'Business'], ['category', 'Sector'], ['phone', 'Phone'], ['address', 'Address'], ['city', 'City'],
+  ['pincode', 'Pincode'], ['distance_km', 'Km'], ['confidence', 'Score']]
+
+const Pill = ({ t }) => <span className={`pill ${t || 'Low'}`}>{t || '-'}</span>
+
+function errText(x) {
+  const d = x?.response?.data?.detail
+  if (Array.isArray(d)) return d[0]?.msg || 'Check the form.'
+  return typeof d === 'string' ? d : 'Cannot reach the backend on port 8000. Is uvicorn running?'
+}
+
+function SearchPanel({ onStart, busy }) {
+  const [f, setF] = useState({ business_type: '', location: '', count: 20 })
+  const [err, setErr] = useState('')
+  const submit = async (e) => {
+    e.preventDefault(); setErr('')
+    try { await onStart(f) } catch (x) { setErr(errText(x)) }
+  }
+  return (
+    <form onSubmit={submit} className="card stack">
+      <div className="grid3">
+        <input className="field" placeholder="What kind of business?" required value={f.business_type}
+          onChange={(e) => setF({ ...f, business_type: e.target.value })} />
+        <input className="field" placeholder="Where? e.g. Koramangala, Bengaluru" required value={f.location}
+          onChange={(e) => setF({ ...f, location: e.target.value })} />
+        <button className="btn" disabled={busy}>{busy ? 'Searching...' : 'Find leads'}</button>
+      </div>
+      <div className="row">
+        <span className="label">Lead volume</span>
+        <div className="seg">
+          {COUNTS.map((c) => (
+            <button type="button" key={c} className={f.count === c ? 'on' : ''}
+              onClick={() => setF({ ...f, count: c })}>{c}</button>
+          ))}
+        </div>
+      </div>
+      <div className="chips">
+        {CHIPS.map((c) => <button type="button" key={c} className="chip"
+          onClick={() => setF({ ...f, business_type: c })}>{c}</button>)}
+      </div>
+      {err && <p className="error">{err}</p>}
+    </form>
+  )
+}
+
+function Progress({ s }) {
+  const ref = useRef(null)
+  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight }, [s?.log])
+  if (!s) return null
+  const failed = s.status === 'failed', done = s.status === 'completed'
+  const idx = done ? 3 : s.status === 'queued' ? 0 : s.found > 0 ? 2 : 1
+  const pct = Math.min(100, Math.round((s.found / Math.max(1, s.requested)) * 100))
+  return (
+    <div className="card stack">
+      <div className="row between">
+        <strong>{s.business_type} in {s.location}</strong>
+        <span className="label">{s.found} found, {s.new_count} new, {s.requested} requested</span>
+      </div>
+      <div className="steps">
+        {STEPS.map((l, i) => (
+          <div key={l} className={`step ${failed && i === idx ? 'fail' : i <= idx ? 'on' : ''}`}><i /><span>{l}</span></div>
+        ))}
+      </div>
+      <div className={`meter ${done ? 'ok' : ''}`}><div style={{ width: pct + '%' }} /></div>
+      {done && s.found < s.requested && <p className="warn">Google Maps returned {s.found} places for this area. Try a wider location.</p>}
+      {s.error && <p className="error">{s.error}</p>}
+      <pre ref={ref} className="console">{(s.log || []).join('\n') || 'Waiting...'}</pre>
+    </div>
+  )
+}
+
+function Drawer({ lead, onClose }) {
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    const h = (e) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [onClose])
+  if (!lead) return null
+  const digits = (lead.phone || '').replace(/\D/g, '')
+  const dir = lead.lat ? `https://www.google.com/maps/dir/?api=1&destination=${lead.lat},${lead.lng}` : lead.maps_url
+  const embed = lead.lat ? `https://maps.google.com/maps?q=${lead.lat},${lead.lng}&z=16&output=embed` : null
+  const copy = () => {
+    navigator.clipboard.writeText([lead.name, lead.phone, lead.address, lead.maps_url, lead.website].filter(Boolean).join('\n'))
+    setCopied(true); setTimeout(() => setCopied(false), 1400)
+  }
+  const Row = ({ k, v }) => v ? <div><div className="k">{k}</div><div className="v">{v}</div></div> : null
+  return (
+    <div className="scrim" onClick={onClose}>
+      <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+        <button className="close" onClick={onClose}>x</button>
+        <h2>{lead.name}</h2>
+        <div className="row"><Pill t={lead.tier} /><span className="label">Score {lead.confidence} - {lead.ring}</span></div>
+        {embed && <iframe className="map" title="Google Maps" src={embed} loading="lazy" />}
+        <div className="kv">
+          <Row k="Sector" v={lead.category} /><Row k="Phone" v={lead.phone} /><Row k="Address" v={lead.address} />
+          <Row k="City" v={lead.city} /><Row k="State" v={lead.state} /><Row k="Pincode" v={lead.pincode} />
+          <Row k="Website" v={lead.website} />
+        </div>
+        <div className="actions">
+          {digits && <a className="act primary" href={`tel:${lead.phone}`}>Call now</a>}
+          {digits && <a className="act" target="_blank" rel="noreferrer" href={`https://wa.me/${digits}`}>WhatsApp</a>}
+          {lead.website && <a className="act" target="_blank" rel="noreferrer" href={lead.website}>Website</a>}
+          <a className="act" target="_blank" rel="noreferrer" href={dir}>Directions</a>
+          <a className="act" target="_blank" rel="noreferrer" href={lead.maps_url}>Google Maps</a>
+          <button className="act" onClick={copy}>{copied ? 'Copied' : 'Copy lead'}</button>
+        </div>
+      </aside>
+    </div>
+  )
+}
+
+function MapPanel({ open, onClose, refreshKey, onSelect }) {
+  const [items, setItems] = useState([])
+  const [cur, setCur] = useState(null)
+  const [q, setQ] = useState('')
+
+  useEffect(() => {
+    if (!open) return
+    api.get('/leads', { params: { sort_by: 'id', order: 'desc', page: 1, page_size: 100 } })
+      .then((r) => {
+        const rows = (r.data.items || []).filter((l) => l.lat && l.lng)
+        setItems(rows)
+        setCur((c) => (c && rows.find((x) => x.id === c.id)) || rows[0] || null)
+      })
+      .catch(() => {})
+  }, [open, refreshKey])
+
+  useEffect(() => {
+    if (!open) return
+    const h = (e) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [open, onClose])
+
+  if (!open) return null
+  const shown = items.filter((l) => (l.name + ' ' + (l.address || '')).toLowerCase().includes(q.toLowerCase()))
+  const embed = cur ? `https://maps.google.com/maps?q=${cur.lat},${cur.lng}&z=16&output=embed` : null
+
+  return (
+    <div className="scrim" onClick={onClose}>
+      <aside className="drawer mapdrawer" onClick={(e) => e.stopPropagation()}>
+        <button className="close" onClick={onClose}>x</button>
+        <h2>Maps</h2>
+        {embed
+          ? <iframe className="map big" title="Google Maps" src={embed} loading="lazy" />
+          : <p className="label">No leads with a location yet. Run a search first.</p>}
+        {cur && (
+          <div className="row between">
+            <strong>{cur.name}</strong>
+            <div className="row">
+              <a className="act" target="_blank" rel="noreferrer" href={cur.maps_url}>Open in Google Maps</a>
+              <button className="act primary" onClick={() => { onSelect(cur); onClose() }}>Lead details</button>
+            </div>
+          </div>
+        )}
+        <input className="field" placeholder="Filter this list" value={q} onChange={(e) => setQ(e.target.value)} />
+        <div className="maplist">
+          {shown.map((l) => (
+            <button key={l.id} className={`mapitem ${cur?.id === l.id ? 'on' : ''}`} onClick={() => setCur(l)}>
+              <span className="mn">{l.name}</span>
+              <span className="ma">{l.address}</span>
+            </button>
+          ))}
+        </div>
+      </aside>
+    </div>
+  )
+}
+
+function Leads({ refreshKey, onSelect }) {
+  const [f, setF] = useState({ q: '', city: '', pincode: '', tier: '', has_website: false, has_phone: false })
+  const [dq, setDq] = useState('')
+  const [sortBy, setSortBy] = useState('id'), [order, setOrder] = useState('desc')
+  const [page, setPage] = useState(1), [size, setSize] = useState(25)
+  const [data, setData] = useState({ total: 0, items: [] })
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => { const t = setTimeout(() => { setDq(f.q); setPage(1) }, 350); return () => clearTimeout(t) }, [f.q])
+  const params = () => {
+    const p = { q: dq, city: f.city, pincode: f.pincode, tier: f.tier }
+    if (f.has_website) p.has_website = true
+    if (f.has_phone) p.has_phone = true
+    return p
+  }
+  useEffect(() => {
+    setLoading(true)
+    api.get('/leads', { params: { ...params(), sort_by: sortBy, order, page, page_size: size } })
+      .then((r) => setData(r.data)).catch(() => {}).finally(() => setLoading(false))
+    // eslint-disable-next-line
+  }, [dq, f.city, f.pincode, f.tier, f.has_website, f.has_phone, sortBy, order, page, size, refreshKey])
+
+  const set = (k, v) => { setF({ ...f, [k]: v }); setPage(1) }
+  const sort = (c) => { if (sortBy === c) setOrder(order === 'asc' ? 'desc' : 'asc'); else { setSortBy(c); setOrder('asc') }; setPage(1) }
+  const exportFile = (fmt) => window.open(`${API}/api/export?` + new URLSearchParams({ ...params(), format: fmt }))
+  const pages = Math.max(1, Math.ceil(data.total / size))
+
+  return (
+    <div className="card stack">
+      <div className="filters">
+        <input className="field" style={{ width: 220 }} placeholder="Search leads" value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} />
+        <input className="field" style={{ width: 130 }} placeholder="City" value={f.city} onChange={(e) => set('city', e.target.value)} />
+        <input className="field" style={{ width: 110 }} placeholder="Pincode" value={f.pincode} onChange={(e) => set('pincode', e.target.value)} />
+        <select className="field" value={f.tier} onChange={(e) => set('tier', e.target.value)}>
+          <option value="">All confidence</option><option>High</option><option>Medium</option><option>Low</option>
+        </select>
+        <label className="check"><input type="checkbox" checked={f.has_phone} onChange={(e) => set('has_phone', e.target.checked)} /> Has phone</label>
+        <label className="check"><input type="checkbox" checked={f.has_website} onChange={(e) => set('has_website', e.target.checked)} /> Has website</label>
+        <div className="spacer">
+          <button className="btn ghost" onClick={() => exportFile('csv')}>Export CSV</button>
+          <button className="btn ghost" onClick={() => exportFile('xlsx')}>Export Excel</button>
+        </div>
+      </div>
+      <div className="tw">
+        <table>
+          <thead><tr>
+            {COLS.map(([k, l]) => <th key={k} onClick={() => sort(k)}>{l}{sortBy === k ? (order === 'asc' ? ' ^' : ' v') : ''}</th>)}
+            <th>Confidence</th>
+          </tr></thead>
+          <tbody style={{ opacity: loading ? 0.5 : 1 }}>
+            {data.items.map((l) => (
+              <tr key={l.id} onClick={() => onSelect(l)}>
+                {COLS.map(([k]) => <td key={k} className={k === 'name' ? 'name' : ''}>{l[k]}</td>)}
+                <td><Pill t={l.tier} /></td>
+              </tr>
+            ))}
+            {!loading && data.items.length === 0 && <tr><td colSpan={9} className="empty">No leads yet. Enter a business type and a place above.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      <div className="pager">
+        <span>{data.total} leads</span>
+        <div className="row">
+          <select className="field" style={{ height: 34, width: 'auto' }} value={size} onChange={(e) => { setSize(Number(e.target.value)); setPage(1) }}>
+            {[25, 50, 100].map((n) => <option key={n} value={n}>{n} per page</option>)}
+          </select>
+          <button className="btn ghost" disabled={page <= 1} onClick={() => setPage(page - 1)}>Previous</button>
+          <span>Page {page} of {pages}</span>
+          <button className="btn ghost" disabled={page >= pages} onClick={() => setPage(page + 1)}>Next</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function History({ refreshKey, onRerun, busy }) {
+  const [rows, setRows] = useState([])
+  useEffect(() => { api.get('/searches').then((r) => setRows(r.data)).catch(() => {}) }, [refreshKey])
+  return (
+    <div className="card tw">
+      <table>
+        <thead><tr>{['Date', 'Business type', 'Location', 'Requested', 'Found', 'New', 'Status', ''].map((h) => <th key={h}>{h}</th>)}</tr></thead>
+        <tbody>
+          {rows.map((s) => (
+            <tr key={s.id} style={{ cursor: 'default' }}>
+              <td>{new Date(s.created_at + 'Z').toLocaleString()}</td><td>{s.business_type}</td><td>{s.location}</td>
+              <td>{s.requested}</td><td>{s.found}</td><td>{s.new_count}</td><td>{s.status}</td>
+              <td><button className="btn ghost" disabled={busy} onClick={() => onRerun(s)}>Run again</button></td>
+            </tr>
+          ))}
+          {rows.length === 0 && <tr><td colSpan={8} className="empty">No searches yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+export default function App() {
+  const [tab, setTab] = useState('leads')
+  const [active, setActive] = useState(null)
+  const [selected, setSelected] = useState(null)
+  const [mapOpen, setMapOpen] = useState(false)
+  const [refreshKey, setRefreshKey] = useState(0)
+  const busy = !!active && ['queued', 'running'].includes(active.status)
+
+  useEffect(() => {
+    if (!busy) return
+    const t = setInterval(async () => {
+      try {
+        const { data } = await api.get(`/searches/${active.id}`)
+        setActive(data); setRefreshKey((k) => k + 1)
+      } catch (e) { /* keep polling */ }
+    }, 1500)
+    return () => clearInterval(t)
+  }, [busy, active?.id])
+
+  const start = async (payload) => {
+    const { data } = await api.post('/searches', payload)
+    setActive(data); setTab('leads')
+  }
+
+  return (
+    <>
+      <nav className="nav"><div>
+        <span className="brand">LeadIt</span>
+        <span className="note">Google Maps lead generation</span>
+        <button className="btn push" onClick={() => setMapOpen(true)}>Maps</button>
+      </div></nav>
+      <main className="wrap">
+        <section className="hero">
+          <h1>Every local business.<br />One search.</h1>
+          <p>Pick a business type and a place. LeadIt pulls the listings from Google Maps and ranks the nearest first.</p>
+        </section>
+        <div className="stack">
+          <SearchPanel onStart={start} busy={busy} />
+          <Progress s={active} />
+          <div className="tabs"><div className="seg">
+            {[['leads', 'Leads'], ['history', 'Search history']].map(([k, l]) => (
+              <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{l}</button>
+            ))}
+          </div></div>
+          {tab === 'leads'
+            ? <Leads refreshKey={refreshKey} onSelect={setSelected} />
+            : <History refreshKey={refreshKey} busy={busy}
+                onRerun={(s) => start({ business_type: s.business_type, location: s.location, count: s.requested })} />}
+        </div>
+      </main>
+      <Drawer lead={selected} onClose={() => setSelected(null)} />
+      <MapPanel open={mapOpen} onClose={() => setMapOpen(false)} refreshKey={refreshKey} onSelect={setSelected} />
+    </>
+  )
+}

@@ -1,0 +1,290 @@
+﻿import asyncio, os, random, re, sys
+from urllib.parse import quote, unquote, urlparse
+from playwright.async_api import async_playwright
+from .freeproxy import fill_pool, proxy_url, wait_for_pool
+
+
+class Blocked(Exception):
+    """Google rate limit / captcha."""
+
+
+class NoConnection(Exception):
+    """No usable connection left."""
+
+
+def pw_proxy(p):
+    if not p:
+        return None
+    u = urlparse(proxy_url(p))
+    d = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        d["username"], d["password"] = unquote(u.username), unquote(u.password or "")
+    return d
+
+
+def mask(p):
+    return (urlparse(proxy_url(p)).hostname or "proxy") if p else "your own IP"
+
+
+def is_conn_error(e):
+    return "net::ERR_" in str(e)
+
+
+async def block_heavy(route):
+    if route.request.resource_type in ("image", "font", "media"):
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def check_block(page, resp=None):
+    if resp is not None and resp.status == 429:
+        raise Blocked("Google returned HTTP 429 (rate limit)")
+    if "/sorry/" in page.url:
+        raise Blocked("Google showed a captcha page")
+    if "unusual traffic" in (await page.content())[:30000].lower():
+        raise Blocked("Google flagged unusual traffic")
+
+
+async def consent(page):
+    for t in ("Accept all", "Reject all"):
+        b = page.get_by_role("button", name=t)
+        if await b.count():
+            await b.first.click()
+            await page.wait_for_timeout(800)
+            return
+
+
+async def collect_links(page, want):
+    links, stale = [], 0
+    feed = page.locator('div[role="feed"]')
+    while len(links) < want and stale < 5:
+        hrefs = await page.eval_on_selector_all("a.hfpxzc", "e=>e.map(x=>x.href)")
+        stale = stale + 1 if len(hrefs) == len(links) else 0
+        links = hrefs
+        if await page.locator("text=reached the end of the list").count():
+            break
+        await feed.evaluate("e=>e.scrollBy(0,e.scrollHeight)")
+        await page.wait_for_timeout(800)
+    return links
+
+
+async def detail(ctx, href):
+    d = await ctx.new_page()
+    try:
+        resp = await d.goto(href, timeout=25000, wait_until="domcontentloaded")
+        await check_block(d, resp)
+        await d.wait_for_selector("h1", timeout=10000)
+        await d.wait_for_timeout(500)
+
+        async def attr(sel, a="aria-label"):
+            l = d.locator(sel).first
+            return ((await l.get_attribute(a)) or "") if await l.count() else ""
+
+        strip = lambda s: re.sub(r"^\W*(?:Address|Phone):\s*", "", s).strip()
+        h = d.locator("h1.DUwDvf")
+        name = (await h.first.inner_text()) if await h.count() else (await d.locator("h1").first.inner_text())
+        m = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", href)
+        return {"name": name.strip(),
+                "address": strip(await attr('button[data-item-id="address"]')),
+                "phone": strip(await attr('button[data-item-id^="phone"]')),
+                "website": await attr('a[data-item-id="authority"]', "href"),
+                "lat": float(m.group(1)) if m else None,
+                "lng": float(m.group(2)) if m else None,
+                "maps_url": href}
+    finally:
+        await d.close()
+
+
+class Connection:
+    """One connection for the whole job. A proxy is replaced ONLY when it is
+    dead (connection errors). Rate limits are waited out, never bypassed."""
+
+    def __init__(self, br, pool, log, proxy):
+        self.br, self.pool, self.log = br, pool, log
+        self.proxy, self.ctx = proxy, None
+        self.conn_fails = 0
+        self.blocks = 0
+        self.max_blocks = int(os.getenv("RATE_LIMIT_RETRIES", "2"))
+        self.backoff = int(os.getenv("RATE_LIMIT_WAIT_SECONDS", "90"))
+        self.replaced = 0
+
+    async def _open(self):
+        if not self.ctx:
+            self.ctx = await self.br.new_context(
+                proxy=pw_proxy(self.proxy), locale="en-IN",
+                viewport={"width": 1280, "height": 900})
+            await self.ctx.route("**/*", block_heavy)
+        return self.ctx
+
+    async def close(self):
+        if self.ctx:
+            try:
+                await self.ctx.close()
+            except Exception:
+                pass
+            self.ctx = None
+
+    async def _replace_dead_proxy(self):
+        dead = self.proxy
+        if dead in self.pool:
+            self.pool.remove(dead)
+        await self.close()
+        if not self.pool:
+            raise NoConnection(f"Proxy {mask(dead)} is dead and no other validated proxy is available")
+        self.proxy = random.choice(self.pool)
+        self.replaced += 1
+        self.log(f"Proxy {mask(dead)} stopped responding (connection error); using {mask(self.proxy)}")
+
+    async def call(self, fn, *args):
+        while True:
+            ctx = await self._open()
+            try:
+                r = await fn(ctx, *args)
+                self.conn_fails = 0
+                self.blocks = 0
+                return r
+            except Blocked as e:
+                self.blocks += 1
+                if self.blocks > self.max_blocks:
+                    raise
+                wait = self.backoff * (2 ** (self.blocks - 1))
+                self.log(f"{e}. Pausing {wait}s on the same connection "
+                         f"(retry {self.blocks}/{self.max_blocks})")
+                await self.close()
+                await asyncio.sleep(wait)
+            except Exception as e:
+                if not is_conn_error(e):
+                    raise
+                self.conn_fails += 1
+                if self.conn_fails >= 2:
+                    if not self.proxy:
+                        raise NoConnection(f"Your own connection failed: {str(e)[:100]}")
+                    await self._replace_dead_proxy()
+                    self.conn_fails = 0
+                else:
+                    await asyncio.sleep(2)
+
+
+async def scrape_async(keyword, location, count, log, on_row):
+    manual = [p.strip() for p in os.getenv("PROXY_LIST", "").split(",") if p.strip()]
+    use = os.getenv("USE_PROXY", "false").lower() == "true"
+    free = use and not manual and os.getenv("FREE_PROXIES", "true").lower() == "true"
+    delay = float(os.getenv("REQUEST_DELAY_SECONDS", "2"))
+    wait_s = float(os.getenv("PROXY_WAIT_SECONDS", "60"))
+
+    pool = list(manual)
+    state = {"n": 0, "center": None, "stopped": None}
+    seen = set()
+    stop = asyncio.Event()
+    filler = None
+
+    if free:
+        filler = asyncio.create_task(fill_pool(pool, log, stop))
+        log(f"Waiting up to {int(wait_s)}s for a working free proxy...")
+        if not await wait_for_pool(pool, wait_s):
+            log("No working free proxy found; continuing on your own IP "
+                "(free proxies rarely work with Google Maps)")
+    proxy = random.choice(pool) if (use and pool) else None
+    log(f"Connection for this job: {mask(proxy)} (stays the same unless it dies)")
+
+    async def pause():
+        await asyncio.sleep(delay * random.uniform(0.7, 1.5))
+
+    async with async_playwright() as pw:
+        br = await pw.chromium.launch(headless=os.getenv("HEADLESS", "true").lower() != "false")
+        conn = Connection(br, pool, log, proxy)
+
+        async def search_page(ctx, url, need):
+            page = await ctx.new_page()
+            try:
+                resp = await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                await consent(page)
+                await check_block(page, resp)
+                await page.wait_for_selector('div[role="feed"]', timeout=20000)
+                await page.wait_for_timeout(1200)
+                m = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", page.url)
+                if m and state["center"] is None:
+                    state["center"] = (float(m.group(1)), float(m.group(2)))
+                return await collect_links(page, need + 10)
+            finally:
+                await page.close()
+
+        async def session(url):
+            need = count - state["n"]
+            if need <= 0:
+                return
+            try:
+                links = await conn.call(search_page, url, need)
+            except Blocked:
+                raise
+            except NoConnection:
+                raise
+            except Exception as e:
+                log(f"Search page failed ({type(e).__name__}); skipping this area")
+                return
+            todo = []
+            for href in links:
+                key = href.split("?")[0]
+                if key not in seen:
+                    seen.add(key)
+                    todo.append(href)
+                if len(todo) >= need:
+                    break
+            log(f"{len(links)} listings visible, reading {len(todo)}")
+            for href in todo:
+                if state["n"] >= count:
+                    break
+                try:
+                    row = await conn.call(detail, href)
+                except (Blocked, NoConnection):
+                    raise
+                except Exception:
+                    continue
+                state["n"] += 1
+                on_row(row)
+                if state["n"] % 5 == 0:
+                    log(f"{state['n']}/{count} saved")
+                await pause()
+
+        try:
+            q = f"{keyword} in {location}"
+            log(f"Google Maps search: {q}")
+            await session("https://www.google.com/maps/search/" + quote(q))
+            c = state["center"]
+            if c and state["n"] < count:
+                cells = sorted(((dx, dy) for dx in range(-3, 4) for dy in range(-3, 4)
+                                if (dx, dy) != (0, 0)),
+                               key=lambda t: t[0] ** 2 + t[1] ** 2)[:24]
+                for dx, dy in cells:
+                    if state["n"] >= count:
+                        break
+                    lat, lng = c[0] + dy * 0.012, c[1] + dx * 0.012
+                    log(f"Expanding to a nearby area ({state['n']}/{count} so far)")
+                    await session(f"https://www.google.com/maps/search/{quote(keyword)}/@{lat:.5f},{lng:.5f},15z")
+        except Blocked as e:
+            log(f"STOPPED: {e}. Google is limiting this connection. "
+                f"Saved {state['n']} leads. Try again later, or use the Google Places API.")
+        except NoConnection as e:
+            log(f"STOPPED: {e}. Saved {state['n']} leads.")
+        except Exception as e:
+            log(f"Scraper error: {type(e).__name__}: {str(e)[:150]}")
+        finally:
+            stop.set()
+            if filler:
+                filler.cancel()
+            await conn.close()
+            try:
+                await br.close()
+            except Exception:
+                pass
+    log(f"Done: {state['n']} leads, dead proxies replaced: {conn.replaced}")
+    return state["center"]
+
+
+def scrape(keyword, location, count, log, on_row):
+    loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(scrape_async(keyword, location, count, log, on_row))
+    finally:
+        loop.close()
